@@ -1,0 +1,16 @@
+name = "fscx"
+main = "fscx-d1.js"
+compatibility_date = "2024-01-01"
+
+# ADMIN_PASSWORD 已移除明文配置
+# 请执行以下命令设置密码（仅存储在 Cloudflare 加密存储中，不进入版本控制）：
+#   wrangler secret put ADMIN_PASSWORD
+
+[[d1_databases]]
+binding       = "DB"
+database_name = "fscx-db"
+database_id   = "2e408b86-6f4c-4320-a288-6294f6bbacbf"
+
+[[kv_namespaces]]
+binding = "KV"
+id      = "d28475f74a094c958dc47721f7404bae"
