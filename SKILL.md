@@ -1,4 +1,4 @@
-# 📋 学业水平评价成绩查询系统（fscx）
+[# 📋 学业水平评价成绩查询系统（fscx）
 
 > 一个基于 **Cloudflare Workers + D1 + KV** 构建的轻量级学业成绩查询平台。  
 > 支持学生自助查询、教师工作台、管理后台三套界面，单文件部署，零运维成本。
@@ -578,3 +578,4 @@ ADMIN_PASSWORD=你的本地测试密码
 ---
 
 *如有问题或建议，欢迎提 Issue 或 PR。*
+](https://blog.112323zxcv.dpdns.org/article/000006/.html)
