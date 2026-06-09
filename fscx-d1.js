@@ -159,6 +159,13 @@ export default {
       if (rlPub.blocked) return json({ success: false, message: rlPub.message }, 429);
 
       const body = await getJSON();
+
+      // 教师端获取考试批次列表（不需要验证，仅返回 exams 列表）
+      if (body?._getExams) {
+        const exams = await db.getConfig("exams", []);
+        return json({ success: true, exams });
+      }
+
       const { examId: examSessionId, uid, verifyMap } = body;
       if (!examSessionId || !uid) return json({ success: false, message: "参数不完整" });
       if (!isValidUid(uid)) return json({ success: false, message: "准考证号格式不正确" });
@@ -325,6 +332,213 @@ export default {
     }
 
     // ══════════════════════════════════════════════════════════
+    //  教师账号管理 API（需管理员 token）
+    // ══════════════════════════════════════════════════════════
+    if (url.pathname === "/api/admin/teacher" && method === "POST") {
+      const body = await getJSON();
+      if (!await authByToken(body)) return json({ success: false, message: "未登录或会话已过期" }, 401);
+
+      // 读取教师索引
+      const getTchrIndex = async () => {
+        try { const r = await env.KV.get("tchr:index"); return r ? JSON.parse(r) : []; } catch { return []; }
+      };
+      const saveTchrIndex = async (idx) => {
+        try { await env.KV.put("tchr:index", JSON.stringify(idx)); } catch {}
+      };
+
+      if (body.action === "list") {
+        const idx = await getTchrIndex();
+        const teachers = await Promise.all(idx.map(async id => {
+          try { const r = await env.KV.get("tchr:" + id); return r ? JSON.parse(r) : null; } catch { return null; }
+        }));
+        return json({ success: true, data: teachers.filter(Boolean) });
+      }
+
+      const hashPwd = async (pwd) => {
+        const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(pwd));
+        return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,"0")).join("");
+      };
+
+      if (body.action === "add") {
+        const { id, password, type, subject, classes, name } = body;
+        if (!id || !password) return json({ success: false, message: "编号和密码不能为空" });
+        const existing = await env.KV.get("tchr:" + id).catch(() => null);
+        if (existing) return json({ success: false, message: "该编号已存在" });
+        const teacher = { id, password: await hashPwd(password), type: type || "subject", subject: subject || "", classes: classes || [], name: name || id };
+        await env.KV.put("tchr:" + id, JSON.stringify(teacher));
+        const idx = await getTchrIndex();
+        if (!idx.includes(id)) { idx.push(id); await saveTchrIndex(idx); }
+        return json({ success: true });
+      }
+
+      if (body.action === "delete") {
+        const { id } = body;
+        if (!id) return json({ success: false, message: "缺少编号" });
+        await env.KV.delete("tchr:" + id).catch(() => {});
+        // 同时撤销该教师所有 token（遍历代价高，用前缀标记）
+        const idx = (await getTchrIndex()).filter(x => x !== id);
+        await saveTchrIndex(idx);
+        return json({ success: true });
+      }
+
+      if (body.action === "update") {
+        const { id, password, type, subject, classes, name } = body;
+        if (!id) return json({ success: false, message: "缺少编号" });
+        const existing = await env.KV.get("tchr:" + id).catch(() => null);
+        if (!existing) return json({ success: false, message: "教师不存在" });
+        const old = JSON.parse(existing);
+        const updated = { ...old, name: name ?? old.name, password: password ? await hashPwd(password) : old.password, type: type || old.type, subject: subject ?? old.subject, classes: classes ?? old.classes };
+        await env.KV.put("tchr:" + id, JSON.stringify(updated));
+        return json({ success: true });
+      }
+
+      return json({ success: false, message: "未知操作" });
+    }
+
+    // ── 教师登录 ─────────────────────────────────────────────
+    if (url.pathname === "/api/teacher/login" && method === "POST") {
+      const body = await getJSON();
+      const rl = await checkRateLimit();
+      if (rl.blocked) return json({ success: false, message: rl.message }, 429);
+      const { id, password } = body;
+      if (!id || !password) return json({ success: false, message: "请输入编号和密码" });
+      let teacher = null;
+      try { const r = await env.KV.get("tchr:" + id); teacher = r ? JSON.parse(r) : null; } catch {}
+      const hashPwd = async (pwd) => {
+        const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(pwd));
+        return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,"0")).join("");
+      };
+      if (!teacher || teacher.password !== await hashPwd(password)) {
+        await recordFailedLogin(rl.ip, rl.rec);
+        return json({ success: false, message: "编号或密码错误" }, 401);
+      }
+      await clearRateLimit(rl.ip);
+      // 签发教师 token（存教师ID，8h有效）
+      const token = crypto.randomUUID() + crypto.randomUUID();
+      try { await env.KV.put("tchtok:" + token, id, { expirationTtl: 8 * 3600 }); } catch {
+        return json({ success: false, message: "服务暂时不可用" }, 503);
+      }
+      return json({ success: true, token, teacher: { id: teacher.id, name: teacher.name, type: teacher.type, subject: teacher.subject, classes: teacher.classes } });
+    }
+
+    // ── 教师登出 ─────────────────────────────────────────────
+    if (url.pathname === "/api/teacher/logout" && method === "POST") {
+      const body = await getJSON();
+      const tok = body?.token;
+      if (tok) await env.KV.delete("tchtok:" + tok).catch(() => {});
+      return json({ success: true });
+    }
+
+    // ── 教师数据查询（班级成绩 + 统计）────────────────────────
+    if (url.pathname === "/api/teacher/data" && method === "POST") {
+      const body = await getJSON();
+      const tok = body?.token;
+      if (!tok) return json({ success: false, message: "未登录" }, 401);
+
+      // 并行：验证 token + 读取配置
+      const { examSessionId, className } = body;
+      if (!examSessionId) return json({ success: false, message: "请选择考试批次" });
+      if (!className)     return json({ success: false, message: "请选择班级" });
+
+      const [teacherId, fieldsArr, directionsArr, allRows] = await Promise.all([
+        env.KV.get("tchtok:" + tok).catch(() => null),
+        db.getConfig("fields", DEFAULT_FIELDS),
+        db.getConfig("directions", DEFAULT_DIRECTIONS),
+        env.DB.prepare("SELECT uid, direction, fields, scores FROM scores WHERE exam_id = ?")
+          .bind(examSessionId).all()
+      ]);
+
+      if (!teacherId) return json({ success: false, message: "会话已过期，请重新登录" }, 401);
+
+      // 用 teacherId 查教师信息（token 验证完才有 id，无法提前并行）
+      let teacher = null;
+      try { const r = await env.KV.get("tchr:" + teacherId); teacher = r ? JSON.parse(r) : null; } catch {}
+      if (!teacher) return json({ success: false, message: "账号不存在" }, 401);
+
+      if (teacher.type !== "homeroom" && !teacher.classes.includes(className))
+        return json({ success: false, message: "无权查看该班级" });
+
+      // 解析成绩数据
+      const allData = (allRows.results || []).map(r => ({
+        uid: r.uid, direction: r.direction,
+        fields: JSON.parse(r.fields || "{}"),
+        scores: JSON.parse(r.scores || "{}")
+      }));
+
+      // 找班级字段ID
+      const classFieldId = fieldsArr.find(f => f.label.includes("班") || f.id.includes("class"))?.id;
+      if (!classFieldId) return json({ success: false, message: "未找到班级字段，请在查询字段中确认字段标签含【班】字" });
+
+      // 过滤出该班学生
+      const classData = allData.filter(s => s.fields[classFieldId] === className);
+      if (!classData.length) return json({ success: false, message: "该班级暂无成绩数据" });
+
+      // 确定可见科目
+      const allSubjects = [...new Set(directionsArr.flatMap(d => d.subjects || []))];
+      const visibleSubjects = teacher.type === "homeroom" ? allSubjects : [teacher.subject].filter(Boolean);
+
+      // 年级所有班级
+      const gradeClasses = [...new Set(allData.map(s => s.fields[classFieldId]).filter(Boolean))];
+
+      // 计算年级各科平均分（按班级汇总）
+      const classAvgMap = {};
+      for (const cn of gradeClasses) {
+        const cd = allData.filter(s => s.fields[classFieldId] === cn);
+        classAvgMap[cn] = {};
+        for (const subj of visibleSubjects) {
+          const vals = cd.map(s => Number(s.scores[subj] || 0)).filter(v => v > 0);
+          classAvgMap[cn][subj] = vals.length ? (vals.reduce((a, b) => a + b, 0) / vals.length) : 0;
+        }
+      }
+
+      // 计算总分（全科）
+      const getTotalScore = (s) => allSubjects.reduce((sum, subj) => sum + Number(s.scores[subj] || 0), 0);
+
+      // 年级 / 班级排名
+      const gradeSorted = [...allData].sort((a, b) => getTotalScore(b) - getTotalScore(a));
+      const gradeRankMap = {};
+      gradeSorted.forEach((s, i) => { gradeRankMap[s.uid] = i + 1; });
+
+      const classSorted = [...classData].sort((a, b) => getTotalScore(b) - getTotalScore(a));
+      const classRankMap = {};
+      classSorted.forEach((s, i) => { classRankMap[s.uid] = i + 1; });
+
+      // 各科班级均分年级排名
+      const subjGradeRank = {};
+      for (const subj of visibleSubjects) {
+        const sorted = [...gradeClasses].sort((a, b) => (classAvgMap[b]?.[subj] || 0) - (classAvgMap[a]?.[subj] || 0));
+        subjGradeRank[subj] = sorted.indexOf(className) + 1;
+      }
+
+      // 本班各科平均分
+      const classSubjAvg = classAvgMap[className] || {};
+      const classSubjAvgTotal = visibleSubjects.length
+        ? visibleSubjects.reduce((s, subj) => s + (classSubjAvg[subj] || 0), 0) / visibleSubjects.length
+        : 0;
+
+      // 组装学生数据
+      const students = classData.map(s => {
+        const visScores = {};
+        for (const subj of visibleSubjects) visScores[subj] = s.scores[subj] || 0;
+        return {
+          uid: s.uid, fields: s.fields, direction: s.direction,
+          scores: visScores,
+          total: getTotalScore(s),
+          classRank: classRankMap[s.uid],
+          gradeRank: gradeRankMap[s.uid]
+        };
+      });
+
+      return json({
+        success: true,
+        teacher: { id: teacher.id, name: teacher.name, type: teacher.type, subject: teacher.subject },
+        className, totalStudents: allData.length, classCount: gradeClasses.length,
+        visibleSubjects, students, classSubjAvg, subjGradeRank,
+        classAvgTotal: classSubjAvgTotal
+      });
+    }
+
+    // ══════════════════════════════════════════════════════════
     //  页面路由
     // ══════════════════════════════════════════════════════════
 
@@ -332,7 +546,7 @@ export default {
     const frontCSS = `
 *{box-sizing:border-box;margin:0;padding:0}
 :root{--blue:#0a3d7c;--blue2:#1565c0;--blue3:#e8f0fe;--red:#c62828;--gold:#b8960c;--border:#d0d7e6;--text:#1a1a2e;--sub:#4a5568}
-body{font-family:"Noto Serif SC","SimSun","宋体",serif;background:#f4f6fb;color:var(--text);min-height:100vh;display:flex;flex-direction:column}
+body{font-family:"PingFang SC","Microsoft YaHei","Hiragino Sans GB","WenQuanYi Micro Hei",sans-serif;background:#f4f6fb;color:var(--text);min-height:100vh;display:flex;flex-direction:column}
 .top-bar{height:4px;background:linear-gradient(90deg,var(--blue) 0%,var(--blue2) 60%,var(--gold) 100%)}
 .header{background:var(--blue);color:#fff;padding:0 24px}
 .header-inner{max-width:960px;margin:0 auto;display:flex;align-items:center;gap:20px;padding:18px 0}
@@ -363,6 +577,32 @@ footer a:hover{color:rgba(255,255,255,.7)}
 .btn-main{display:block;width:100%;padding:13px;background:var(--blue);color:#fff;border:none;font-size:15px;font-family:inherit;font-weight:700;letter-spacing:3px;cursor:pointer;transition:background .2s;margin-top:4px}
 .btn-main:hover{background:var(--blue2)}
 .err{color:var(--red);font-size:13px;margin-top:8px;text-align:center;min-height:18px}
+@media(max-width:600px){
+.header{padding:0 12px}
+.header-inner{gap:12px;padding:12px 0}
+.header-emblem{width:40px;height:40px;font-size:18px}
+.header-text h1{font-size:16px;letter-spacing:1px}
+.header-text p{font-size:11px}
+.nav a{padding:9px 14px;font-size:12px}
+.breadcrumb{padding:0 12px;margin:8px auto}
+main{padding:0 10px 30px}
+.card-body{padding:16px 14px}
+.form-grid{grid-template-columns:1fr;gap:12px}
+.notice{padding:10px 12px;font-size:12px}
+.btn-main{font-size:14px;padding:13px;letter-spacing:1px}
+.info-grid{grid-template-columns:1fr}
+.info-cell:nth-child(2n){border-right:1px solid var(--border)}
+.info-cell:nth-last-child(-n+2){border-bottom:1px solid var(--border)}
+.info-cell:last-child{border-bottom:none}
+table{font-size:13px}
+thead th{padding:8px 10px}
+tbody td{padding:7px 10px}
+.hist-tab{padding:7px 12px;font-size:12px}
+.back-bar{flex-direction:column;align-items:flex-start;gap:8px}
+.btn-back{width:100%;text-align:center;padding:11px}
+.tip{font-size:11px}
+footer{padding:12px}
+}
 `;
 
     // ─── GET /  前台首页 ─────────────────────────────────────
@@ -370,7 +610,7 @@ footer a:hover{color:rgba(255,255,255,.7)}
       return html(`<!doctype html><html lang="zh-CN"><head>
 <meta charset="utf-8"><title>加载中…</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;600;700&display=swap" rel="stylesheet">
+
 <style>${frontCSS}
 .full-select{grid-column:1/-1}
 </style></head><body>
@@ -443,7 +683,9 @@ function go(){
   }
   err.textContent="";
   const uid = _uidField ? vals[_uidField.id] : Object.values(vals)[0];
-  location.href="/result?"+new URLSearchParams({examSession, uid, data:JSON.stringify(vals)});
+  // 用 sessionStorage 传参，避免敏感信息暴露在 URL 中
+  sessionStorage.setItem("qp", JSON.stringify({examSession, uid, data:vals}));
+  location.href="/result";
 }
 document.addEventListener("keydown",e=>{if(e.key==="Enter")go();});
 </script></body></html>`);
@@ -454,7 +696,7 @@ document.addEventListener("keydown",e=>{if(e.key==="Enter")go();});
       return html(`<!doctype html><html lang="zh-CN"><head>
 <meta charset="utf-8"><title>成绩查询结果</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;600;700&display=swap" rel="stylesheet">
+
 <style>${frontCSS}
 .spinner{width:36px;height:36px;border:3px solid var(--blue3);border-top-color:var(--blue2);border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 14px}
 @keyframes spin{to{transform:rotate(360deg)}}
@@ -528,10 +770,12 @@ tbody td{padding:9px 15px;text-align:center;border-bottom:1px solid #eaeff8}
 </main>
 <footer><span id="footerText"></span></footer>
 <script>
-const p = new URLSearchParams(location.search);
-const examSession = p.get("examSession");
-const uid         = p.get("uid");
-const data        = JSON.parse(p.get("data")||"{}");
+// 从 sessionStorage 读取查询参数，读完即删，避免刷新重复使用
+const _qp = JSON.parse(sessionStorage.getItem("qp")||"null");
+sessionStorage.removeItem("qp");
+const examSession = _qp?.examSession || null;
+const uid         = _qp?.uid || null;
+const data        = _qp?.data || {};
 
 function showErr(msg){
   document.getElementById("loading").style.display="none";
@@ -633,7 +877,7 @@ function switchTab(i){
       return html(`<!doctype html><html lang="zh-CN"><head>
 <meta charset="utf-8"><title>查询说明</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;600;700&display=swap" rel="stylesheet">
+
 <style>${frontCSS}</style></head><body>
 <div class="top-bar"></div>
 <div class="header"><div class="header-inner">
@@ -675,16 +919,273 @@ function switchTab(i){
 </script></body></html>`);
     }
 
-    // ─── GET /admin  后台 ────────────────────────────────────
+    // ─── GET /js  教师端 ─────────────────────────────────────
+    if (method === "GET" && url.pathname === "/js") {
+      const site = await getSite();
+      return html(`<!doctype html><html lang="zh-CN"><head>
+<meta charset="utf-8"><title>教师端 · ${site.pageTitle||"成绩查询"}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#f0f2f5;--ac:#1890ff;--ac2:#096dd9;--red:#ff4d4f;--bd:#e8ecf3;--tx:#1c2438;--sub:#6b7280;--hd:#0d2447}
+body{font-family:"PingFang SC","Microsoft YaHei","Hiragino Sans GB","WenQuanYi Micro Hei",sans-serif;background:var(--bg);color:var(--tx);min-height:100vh}
+#loginPage{min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#0d2447,#1251a3 50%,#0d2447)}
+.lc{background:#fff;width:360px;border-radius:4px;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.35)}
+.lh{background:var(--hd);padding:28px 32px;text-align:center}.lh h1{color:#fff;font-size:18px;letter-spacing:2px;margin-bottom:4px}.lh p{color:rgba(255,255,255,.5);font-size:12px}
+.lb{padding:28px 32px}.lb label{display:block;font-size:12px;color:var(--sub);margin-bottom:5px;font-weight:600}
+.lb input,.lb select{width:100%;padding:10px 13px;border:1px solid var(--bd);border-radius:2px;font-size:14px;outline:none;font-family:inherit;transition:border .2s;margin-bottom:14px}
+.lb input:focus,.lb select:focus{border-color:var(--ac)}
+.btn-login{width:100%;padding:11px;background:var(--ac);color:#fff;border:none;font-size:14px;font-family:inherit;font-weight:600;letter-spacing:2px;cursor:pointer;border-radius:2px;transition:background .2s}
+.btn-login:hover{background:var(--ac2)}.lerr{color:var(--red);font-size:13px;margin-top:8px;text-align:center;min-height:18px}
+#app{display:none;min-height:100vh;flex-direction:column}
+.topnav{background:var(--hd);color:#fff;display:flex;align-items:center;justify-content:space-between;padding:0 24px;height:52px;box-shadow:0 2px 8px rgba(0,0,0,.2)}
+.topnav .logo{font-size:15px;font-weight:700;letter-spacing:1px}
+.topnav .usr{font-size:13px;color:rgba(255,255,255,.65);cursor:pointer}.topnav .usr:hover{color:#fff}
+.main{max-width:1200px;margin:0 auto;padding:20px 16px}
+.card{background:#fff;border-radius:4px;border:1px solid var(--bd);margin-bottom:16px}
+.ch{padding:13px 20px;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between}
+.ch h3{font-size:14px;font-weight:600}
+.cb{padding:16px 20px}
+.toolbar{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap}
+.fg{display:flex;flex-direction:column;gap:4px;min-width:160px}
+.fg label{font-size:12px;color:var(--sub);font-weight:600}
+.fg select{padding:7px 10px;border:1px solid var(--bd);border-radius:2px;font-size:13px;font-family:inherit;outline:none}
+.fg select:focus{border-color:var(--ac)}
+.btn{display:inline-flex;align-items:center;gap:5px;padding:7px 16px;border-radius:2px;border:none;font-size:13px;font-family:inherit;cursor:pointer;font-weight:500;transition:all .15s}
+.btn-p{background:var(--ac);color:#fff}.btn-p:hover{background:var(--ac2)}
+.btn-g{background:#f5f5f5;color:var(--tx);border:1px solid var(--bd)}.btn-g:hover{background:#eee}
+/* stats row */
+.stat-row{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px}
+.scard{background:#fff;border:1px solid var(--bd);border-radius:4px;padding:14px 18px;flex:1;min-width:140px}
+.scard .snum{font-size:22px;font-weight:700;color:var(--ac)}.scard .slbl{font-size:11px;color:var(--sub);margin-top:2px}
+/* table */
+.tw{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{background:#f7f9fc;padding:9px 12px;text-align:left;font-weight:600;color:var(--sub);border-bottom:2px solid var(--bd);white-space:nowrap}
+td{padding:8px 12px;border-bottom:1px solid var(--bd);white-space:nowrap}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:#f7fbff}
+.rank-badge{display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;font-weight:600}
+.rank-1{background:#fff3cd;color:#b8860b}.rank-2{background:#e8f5e9;color:#2e7d32}.rank-3{background:#e3f2fd;color:#1565c0}.rank-n{background:#f5f5f5;color:#888}
+.avg-row td{background:#fffbe6;font-weight:600;color:#b45309}
+.tag-hr{background:#fde8e8;color:#c0392b;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700}
+.tag-sb{background:#e8f0fe;color:#1565c0;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700}
+/* subj avg table */
+.subj-stat{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+.subj-card{background:#f7f9fc;border:1px solid var(--bd);border-radius:4px;padding:10px 14px;min-width:120px}
+.subj-card .sn{font-size:20px;font-weight:700;color:var(--tx)}.subj-card .sl{font-size:11px;color:var(--sub);margin-top:1px}
+.subj-card .sr{font-size:11px;color:var(--ac);font-weight:600;margin-top:3px}
+@media(max-width:600px){
+#loginPage{padding:16px}
+.lc{width:100%;max-width:380px}
+.lh{padding:20px 20px}
+.lb{padding:20px 20px}
+.topnav{padding:0 12px;height:48px}
+.topnav .logo{font-size:13px}
+.topnav .usr{font-size:12px}
+.main{padding:12px 10px}
+.toolbar{flex-direction:column;gap:8px}
+.fg{min-width:unset;width:100%}
+.stat-row{gap:8px}
+.scard{min-width:calc(50% - 4px);padding:10px 12px}
+.scard .snum{font-size:18px}
+.subj-stat{gap:8px}
+.subj-card{min-width:calc(50% - 4px);padding:8px 10px}
+.cb{padding:12px}
+.ch{padding:10px 14px}
+table{font-size:12px}
+th,td{padding:7px 8px}
+}
+</style></head><body>
+<div id="loginPage">
+  <div class="lc">
+    <div class="lh"><h1>教师登录</h1><p>${site.headerSub||"成绩查询平台 · 教师专用"}</p></div>
+    <div class="lb">
+      <label>教师编号</label><input id="tid" type="text" placeholder="请输入编号" onkeydown="if(event.key==='Enter')q('tpwd').focus()">
+      <label>密码</label><input id="tpwd" type="password" placeholder="请输入密码" onkeydown="if(event.key==='Enter')doLogin()">
+      <button class="btn-login" onclick="doLogin()">登　录</button>
+      <div id="lerr" class="lerr"></div>
+    </div>
+  </div>
+</div>
+<div id="app">
+  <div class="topnav">
+    <div class="logo">📋 教师工作台</div>
+    <div class="usr" id="usrLabel" onclick="doLogout()">退出登录</div>
+  </div>
+  <div class="main">
+    <div class="card">
+      <div class="ch"><h3>查询条件</h3></div>
+      <div class="cb">
+        <div class="toolbar">
+          <div class="fg"><label>考试批次</label><select id="sel_exam"><option value="">请选择…</option></select></div>
+          <div class="fg"><label>班　级</label><select id="sel_class"><option value="">请选择…</option></select></div>
+          <button class="btn btn-p" style="margin-bottom:1px" onclick="loadData()">📊 查看成绩</button>
+        </div>
+      </div>
+    </div>
+    <div id="resultArea" style="display:none">
+      <div class="stat-row" id="statRow"></div>
+      <div class="card">
+        <div class="ch"><h3>各科班级统计</h3></div>
+        <div class="cb"><div class="subj-stat" id="subjStat"></div></div>
+      </div>
+      <div class="card">
+        <div class="ch"><h3 id="tableTitle">学生成绩</h3><span id="tableNote" style="font-size:12px;color:var(--sub)"></span></div>
+        <div class="cb" style="padding:0"><div class="tw"><table id="scoreTable"><thead id="th"></thead><tbody id="tb"></tbody></table></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+const q=id=>document.getElementById(id);
+let _tok=sessionStorage.getItem("tch_tok")||"", _teacher=JSON.parse(sessionStorage.getItem("tch_info")||"null");
+let _exams=[], _data=null;
+
+async function api(path,body){
+  const r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({...body,token:_tok})});
+  if(r.status===401){doLogout();return{success:false,message:"会话已过期"};}
+  return r.json();
+}
+
+async function doLogin(){
+  const id=q("tid").value.trim(), pw=q("tpwd").value.trim();
+  if(!id||!pw){q("lerr").textContent="请填写编号和密码";return;}
+  const r=await fetch("/api/teacher/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,password:pw})});
+  const d=await r.json();
+  if(!d.success){q("lerr").textContent=d.message;return;}
+  _tok=d.token; _teacher=d.teacher;
+  sessionStorage.setItem("tch_tok",_tok);
+  sessionStorage.setItem("tch_info",JSON.stringify(_teacher));
+  showApp();
+}
+
+function showApp(){
+  q("loginPage").style.display="none";
+  const app=q("app"); app.style.display="flex"; app.style.flexDirection="column";
+  const typeLabel=_teacher.type==="homeroom"?\`<span class="tag-hr">班主任</span>\`:\`<span class="tag-sb">科任老师·\${_teacher.subject}</span>\`;
+  q("usrLabel").innerHTML=\`\${_teacher.name||_teacher.id} \${typeLabel} 退出\`;
+  loadExams();
+}
+
+async function doLogout(){
+  if(_tok) await fetch("/api/teacher/logout",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:_tok})}).catch(()=>{});
+  _tok=""; _teacher=null;
+  sessionStorage.removeItem("tch_tok"); sessionStorage.removeItem("tch_info");
+  q("loginPage").style.display="flex"; q("app").style.display="none";
+}
+
+async function loadExams(){
+  // 拿考试批次列表（复用 pub 接口的 site config）
+  try{
+    const r=await fetch("/api/pub/query",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({_getExams:true})});
+    const d=await r.json();
+    if(d.exams){
+      _exams=d.exams;
+      const sel=q("sel_exam");
+      sel.innerHTML=\`<option value="">请选择批次…</option>\`+_exams.map(e=>\`<option value="\${e.id}">\${e.label}</option>\`).join("");
+    }
+  }catch{}
+  // 填充班级
+  const sel=q("sel_class");
+  const classes=_teacher.classes||[];
+  if(classes.length===0){sel.innerHTML=\`<option value="">（未分配班级）</option>\`;return;}
+  sel.innerHTML=classes.map(c=>\`<option value="\${c}">\${c}</option>\`).join("");
+}
+
+async function loadData(){
+  const examId=q("sel_exam").value, cls=q("sel_class").value;
+  if(!examId){alert("请选择考试批次");return;}
+  if(!cls){alert("请选择班级");return;}
+  const r=await api("/api/teacher/data",{examSessionId:examId,className:cls});
+  if(!r.success){alert(r.message);return;}
+  _data=r;
+  renderResult();
+}
+
+function rankBadge(n,total){
+  const cls=n===1?"rank-1":n<=3?"rank-2":n<=Math.ceil(total*0.1)?"rank-3":"rank-n";
+  return \`<span class="rank-badge \${cls}">\${n}</span>\`;
+}
+
+function renderResult(){
+  const d=_data;
+  q("resultArea").style.display="block";
+
+  // 统计卡片
+  const classAvgTot=(d.classAvgTotal||0).toFixed(1);
+  q("statRow").innerHTML=\`
+    <div class="scard"><div class="snum">\${d.students.length}</div><div class="slbl">班级人数</div></div>
+    <div class="scard"><div class="snum">\${d.totalStudents}</div><div class="slbl">年级总人数</div></div>
+    <div class="scard"><div class="snum">\${d.classCount}</div><div class="slbl">年级班级数</div></div>
+    <div class="scard"><div class="snum">\${classAvgTot}</div><div class="slbl">班级科目均分</div></div>\`;
+
+  // 各科统计
+  q("subjStat").innerHTML=d.visibleSubjects.map(subj=>{
+    const avg=(d.classSubjAvg[subj]||0).toFixed(1);
+    const rank=d.subjGradeRank[subj]||"-";
+    return \`<div class="subj-card">
+      <div class="sn">\${avg}</div>
+      <div class="sl">\${subj} 班均分</div>
+      <div class="sr">年级第 \${rank} / \${d.classCount} 班</div>
+    </div>\`;
+  }).join("");
+
+  // 表头
+  const isBoss=d.teacher.type==="homeroom";
+  const subjs=d.visibleSubjects;
+  q("tableTitle").textContent=\`\${d.className} · 成绩列表\`;
+  q("tableNote").textContent=isBoss?"班主任视图（全科）":\`科任视图（\${d.teacher.subject}）\`;
+  q("th").innerHTML=\`<tr>
+    <th>姓名</th><th>准考证号</th>
+    \${subjs.map(s=>\`<th>\${s}</th>\`).join("")}
+    \${isBoss?\`<th>总分</th>\`:""}
+    <th>班排</th><th>年排</th>
+  </tr>\`;
+
+  // 表体（按班排升序）
+  const sorted=[...d.students].sort((a,b)=>a.classRank-b.classRank);
+  const tbody=q("tb");
+  tbody.innerHTML="";
+
+  // 平均分行
+  const avgRow=document.createElement("tr");
+  avgRow.className="avg-row";
+  const fields=sorted[0]?.fields||{};
+  const nameKey=Object.keys(fields).find(k=>k.includes("name")||k.includes("姓"))||Object.keys(fields)[0];
+  avgRow.innerHTML=\`<td colspan="2" style="font-weight:700">班级平均分</td>
+    \${subjs.map(s=>\`<td>\${(d.classSubjAvg[s]||0).toFixed(1)}</td>\`).join("")}
+    \${isBoss?\`<td>—</td>\`:""}
+    <td colspan="2">—</td>\`;
+  tbody.appendChild(avgRow);
+
+  sorted.forEach(stu=>{
+    const tr=document.createElement("tr");
+    const nameVal=stu.fields[nameKey]||"—";
+    tr.innerHTML=\`<td>\${nameVal}</td><td style="color:var(--sub);font-size:12px">\${stu.uid}</td>
+      \${subjs.map(s=>\`<td>\${stu.scores[s]??"-"}</td>\`).join("")}
+      \${isBoss?\`<td style="font-weight:700">\${stu.total}</td>\`:""}
+      <td>\${rankBadge(stu.classRank,d.students.length)}</td>
+      <td>\${rankBadge(stu.gradeRank,d.totalStudents)}</td>\`;
+    tbody.appendChild(tr);
+  });
+}
+
+// 自动恢复登录
+if(_tok&&_teacher){ showApp(); } else { q("loginPage").style.display="flex"; }
+</script></body></html>`);
+    }
+
     if (method === "GET" && url.pathname === "/admin") {
       return html(`<!doctype html><html lang="zh-CN"><head>
 <meta charset="utf-8"><title>后台管理</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{--bg:#f0f2f5;--sb:#0d2447;--sb2:#162d52;--ac:#1890ff;--ac2:#096dd9;--red:#ff4d4f;--green:#52c41a;--gold:#faad14;--bd:#e8ecf3;--tx:#1c2438;--sub:#6b7280}
-body{font-family:"Noto Sans SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--tx);min-height:100vh}
+body{font-family:"PingFang SC","Microsoft YaHei","Hiragino Sans GB","WenQuanYi Micro Hei",sans-serif;background:var(--bg);color:var(--tx);min-height:100vh}
 #loginPage{min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#0d2447,#1251a3 50%,#0d2447)}
 .lc{background:#fff;width:360px;border-radius:4px;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.35)}
 .lh{background:#0d2447;padding:28px 32px;text-align:center}
@@ -767,6 +1268,36 @@ tbody td{padding:9px 13px}
 .exam-row .er-info input{padding:6px 10px;border:1px solid var(--bd);border-radius:2px;font-size:13px;font-family:inherit;outline:none}
 .exam-row .er-info input:focus{border-color:var(--ac)}
 .open-toggle{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--sub);white-space:nowrap}
+@media(max-width:768px){
+#loginPage{padding:16px}
+.lc{width:100%;max-width:380px}
+.layout{flex-direction:column;height:auto}
+.sb{width:100%;display:flex;flex-wrap:wrap;padding:4px 8px;gap:0}
+.sb-sec{display:none}
+.sb a{padding:7px 10px;font-size:12px;border-left:none;border-bottom:2px solid transparent;flex-shrink:0}
+.sb a.active{border-bottom-color:var(--ac);border-left:none;background:rgba(24,144,255,.1)}
+.content{padding:12px 10px;overflow-y:unset;height:auto}
+.topnav{padding:0 12px;height:48px}
+.topnav .logo{font-size:13px}
+.topnav .logo-ico{width:24px;height:24px;font-size:12px}
+.topnav .usr{font-size:12px}
+.g2,.g3,.g4{grid-template-columns:1fr 1fr}
+.stat3{grid-template-columns:1fr}
+.field-row{grid-template-columns:1fr 1fr;gap:8px}
+.exam-row .er-info{grid-template-columns:1fr 1fr}
+.lh{padding:20px}
+.lb{padding:20px}
+.cb{padding:12px}
+.ch{padding:10px 14px;flex-wrap:wrap;gap:6px}
+table{font-size:12px}
+th,td{padding:7px 8px}
+}
+@media(max-width:480px){
+.g2,.g3,.g4{grid-template-columns:1fr}
+.exam-row .er-info{grid-template-columns:1fr}
+.field-row{grid-template-columns:1fr}
+.scard{flex-direction:column;gap:6px;align-items:flex-start}
+}
 </style></head><body>
 
 <div id="loginPage">
@@ -802,6 +1333,8 @@ tbody td{padding:9px 13px}
       <a onclick="go('site')"><span class="ico">🎨</span>页面设置</a>
       <div class="sb-sec">统计</div>
       <a onclick="go('stats')"><span class="ico">📊</span>统计概览</a>
+      <div class="sb-sec">账号管理</div>
+      <a onclick="go('teachers')"><span class="ico">👨‍🏫</span>教师账号</a>
     </div>
     <div class="content">
 
@@ -1016,8 +1549,57 @@ tbody td{padding:9px 13px}
           <div class="scard"><div class="sico go">🗂</div><div><div class="snum" id="st_exam">—</div><div class="slbl">考试批次数</div></div></div>
         </div>
         <div class="card">
-          <div class="ch"><h3>各批次录入情况</h3></div>
-          <div class="cb"><div id="st_detail" style="font-size:13px;color:var(--sub)">加载中…</div></div>
+          <div class="ch"><h3>各批次录入情况</h3><span style="font-size:12px;color:var(--sub)">点击批次可展开编辑</span></div>
+          <div class="cb" style="padding:0"><div id="st_detail"></div></div>
+        </div>
+      </div>
+
+      <!-- ══ 教师账号 ══ -->
+      <div id="tab-teachers" class="tab">
+        <div class="card">
+          <div class="ch"><h3>添加教师账号</h3></div>
+          <div class="cb">
+            <div class="g3" style="margin-bottom:12px">
+              <div class="fg"><label>教师编号 *</label><input id="tc_id" placeholder="如 T001"></div>
+              <div class="fg"><label>姓名</label><input id="tc_name" placeholder="如 张老师"></div>
+              <div class="fg"><label>密码 *</label><input id="tc_pw" type="password" placeholder="登录密码"></div>
+            </div>
+            <div class="g3" style="margin-bottom:16px">
+              <div class="fg">
+                <label>账号类型 *</label>
+                <select id="tc_type" onchange="tcTypeChange()">
+                  <option value="subject">科任老师</option>
+                  <option value="homeroom">班主任</option>
+                </select>
+              </div>
+              <div class="fg" id="tc_subj_wrap">
+                <label>负责科目 *</label>
+                <select id="tc_subj"><option value="">请选择…</option></select>
+              </div>
+              <div class="fg">
+                <label>管理班级（多选）</label>
+                <div id="tc_classes" style="display:flex;flex-wrap:wrap;gap:6px;padding:6px 0;min-height:32px"></div>
+              </div>
+            </div>
+            <button class="btn btn-p" onclick="tcAdd()">➕ 添加教师</button>
+            <span id="tc_err" style="color:var(--red);font-size:13px;margin-left:12px"></span>
+          </div>
+        </div>
+        <div class="card">
+          <div class="ch"><h3>教师列表</h3><button class="btn btn-g sm" onclick="tcLoad()">↺ 刷新</button></div>
+          <div class="cb" style="padding:0">
+            <div class="tw"><table>
+              <thead><tr><th>编号</th><th>姓名</th><th>类型</th><th>科目</th><th>管理班级</th><th>操作</th></tr></thead>
+              <tbody id="tc_body"></tbody>
+            </table></div>
+          </div>
+        </div>
+        <div class="card" style="border-left:4px solid #faad14">
+          <div class="cb" style="font-size:13px;color:var(--sub);line-height:2">
+            🔗 教师登录入口：<strong style="color:var(--tx)">/js</strong>（如：<span id="tc_url"></span>）<br>
+            📌 班主任可查看所有科目成绩；科任老师仅能查看自己负责的科目。<br>
+            ⚠️ 教师账号只有查看权限，无法修改学生成绩。
+          </div>
         </div>
       </div>
 
@@ -1025,8 +1607,20 @@ tbody td{padding:9px 13px}
   </div>
 </div>
 
+<!-- 编辑浮层 Modal -->
+<div id="editModal" style="display:none;position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.45);backdrop-filter:blur(2px);overflow-y:auto;padding:24px 16px" onclick="if(event.target===this)closeModal()">
+  <div style="max-width:680px;margin:0 auto;background:var(--bg);border-radius:4px;box-shadow:0 8px 40px rgba(0,0,0,.18)">
+    <div class="ch" style="padding:16px 20px;position:sticky;top:0;background:var(--bg);z-index:1;border-bottom:1px solid var(--bd)">
+      <h3 id="modalTitle">编辑成绩</h3>
+      <button class="btn btn-g sm" onclick="closeModal()">✕ 关闭</button>
+    </div>
+    <div class="cb" id="modalBody" style="padding:20px"></div>
+  </div>
+</div>
+
 <script>
 let pwd="", cfg={site:{},fields:[],directions:[],exams:[]}, allScores=[];
+const esc=(t)=>String(t??"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");
 // [修复 H1] 改用 token 认证，密码仅在登录时使用一次
 // token 优先从 localStorage（记住登录）读取，其次 sessionStorage
 let _token = localStorage.getItem("adm_token") || sessionStorage.getItem("adm_token") || "";
@@ -1115,7 +1709,7 @@ function go(tab){
   document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));
   document.querySelectorAll(".sb a").forEach(a=>a.classList.remove("active"));
   q("tab-"+tab).classList.add("active");
-  const tabs=["scores","add","import","exams","fields","directions","site","stats"];
+  const tabs=["scores","add","import","exams","fields","directions","site","stats","teachers"];
   document.querySelectorAll(".sb a")[tabs.indexOf(tab)]?.classList.add("active");
   if(tab==="exams")    renderExamList();
   if(tab==="fields")   renderFieldList();
@@ -1123,7 +1717,99 @@ function go(tab){
   if(tab==="site")     renderSiteForm();
   if(tab==="stats")    renderStats();
   if(tab==="add")      {renderAddDyn(); renderAddSubj();}
+  if(tab==="teachers") tcInit();
 }
+
+// ═══════════════════════════════════════════════
+//  教师账号管理
+// ═══════════════════════════════════════════════
+function tcInit(){
+  // 显示教师登录 URL
+  const urlEl=q("tc_url");
+  if(urlEl) urlEl.textContent=location.origin+"/js";
+  // 填充科目选择
+  const subjSel=q("tc_subj");
+  if(subjSel){
+    const subjs=[...new Set(cfg.directions.flatMap(d=>d.subjects||[]))];
+    subjSel.innerHTML=\`<option value="">请选择…</option>\`+subjs.map(s=>\`<option value="\${s}">\${s}</option>\`).join("");
+  }
+  // 填充班级复选框（从字段配置里找班级字段的可选值）
+  const classField=cfg.fields.find(f=>f.label.includes("班")||f.id.includes("class"));
+  const classBox=q("tc_classes");
+  if(classBox){
+    // 班级选项：从已有成绩里取，或从字段 options 取
+    const opts=classField?.options||[];
+    if(opts.length){
+      classBox.innerHTML=opts.map(c=>
+        \`<label style="display:flex;align-items:center;gap:4px;font-size:12px;cursor:pointer;background:#f5f5f5;padding:3px 8px;border-radius:2px">
+          <input type="checkbox" value="\${c}" style="width:auto"> \${c}
+        </label>\`
+      ).join("");
+    } else {
+      classBox.innerHTML=\`<span style="font-size:12px;color:var(--sub)">请先在"查询字段"中为班级字段添加可选项，或手动填写</span>
+        <input id="tc_classes_manual" placeholder="逗号分隔，如 高一1班,高一2班" style="margin-top:6px;width:100%;padding:6px 10px;border:1px solid var(--bd);border-radius:2px;font-size:13px;font-family:inherit;outline:none">\`;
+    }
+  }
+  tcLoad();
+}
+
+function tcTypeChange(){
+  const t=q("tc_type")?.value;
+  const wrap=q("tc_subj_wrap");
+  if(wrap) wrap.style.display=t==="homeroom"?"none":"";
+}
+
+function tcGetClasses(){
+  const manual=q("tc_classes_manual");
+  if(manual) return manual.value.split(",").map(s=>s.trim()).filter(Boolean);
+  return [...document.querySelectorAll("#tc_classes input[type=checkbox]:checked")].map(c=>c.value);
+}
+
+async function tcAdd(){
+  const id=q("tc_id").value.trim();
+  const name=q("tc_name").value.trim();
+  const pw=q("tc_pw").value.trim();
+  const type=q("tc_type").value;
+  const subject=q("tc_subj")?.value||"";
+  const classes=tcGetClasses();
+  const err=q("tc_err");
+  err.textContent="";
+  if(!id||!pw){err.textContent="编号和密码不能为空";return;}
+  if(type==="subject"&&!subject){err.textContent="请选择负责科目";return;}
+  if(!classes.length){err.textContent="请至少选择一个班级";return;}
+  const r=await api("/api/admin/teacher",{action:"add",id,name,password:pw,type,subject,classes});
+  if(!r.success){err.textContent=r.message;return;}
+  q("tc_id").value=""; q("tc_name").value=""; q("tc_pw").value="";
+  tcLoad();
+}
+
+async function tcDelete(id, name){
+  const confirmed=confirm(
+    \`⚠️ 确认删除教师账号？\n\n编号：\${id}  姓名：\${name||id}\n\n后果：\n· 该账号将立即无法登录教师端\n· 已登录的 token 将在自然过期前仍有效（最长8小时）\n· 此操作不可撤销\`
+  );
+  if(!confirmed) return;
+  const r=await api("/api/admin/teacher",{action:"delete",id});
+  if(!r.success){alert("删除失败："+r.message);return;}
+  tcLoad();
+}
+
+async function tcLoad(){
+  const tbody=q("tc_body");
+  if(!tbody) return;
+  tbody.innerHTML=\`<tr><td colspan="6" style="text-align:center;color:var(--sub);padding:16px">加载中…</td></tr>\`;
+  const r=await api("/api/admin/teacher",{action:"list"});
+  if(!r.success){tbody.innerHTML=\`<tr><td colspan="6" style="color:red;padding:12px">\${r.message}</td></tr>\`;return;}
+  if(!r.data.length){tbody.innerHTML=\`<tr><td colspan="6" style="text-align:center;color:var(--sub);padding:16px">暂无教师账号</td></tr>\`;return;}
+  tbody.innerHTML=r.data.map(t=>\`<tr>
+    <td><strong>\${t.id}</strong></td>
+    <td>\${t.name||"—"}</td>
+    <td>\${t.type==="homeroom"?'<span style="background:#fde8e8;color:#c0392b;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700">班主任</span>':'<span style="background:#e8f0fe;color:#1565c0;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700">科任老师</span>'}</td>
+    <td>\${t.subject||"（全科）"}</td>
+    <td style="font-size:12px">\${(t.classes||[]).join("、")||"—"}</td>
+    <td><button class="btn btn-d sm" onclick="tcDelete('\${t.id}','\${t.name||t.id}')">🗑 删除</button></td>
+  </tr>\`).join("");
+}
+
 
 function refreshExamDropdowns(){
   const opts='<option value="">全部批次</option>'+cfg.exams.map(e=>\`<option value="\${e.id}">\${e.label}</option>\`).join("");
@@ -1250,8 +1936,17 @@ async function delScore(examSessionId,uid){
   await api("/api/admin/score",{action:"delete",examSessionId,uid});
   await loadScores();
 }
+function closeModal(){
+  q("editModal").style.display="none";
+  document.body.style.overflow="";
+}
+function openModal(title, bodyHtml){
+  q("modalTitle").textContent=title;
+  q("modalBody").innerHTML=bodyHtml;
+  q("editModal").style.display="block";
+  document.body.style.overflow="hidden";
+}
 function editScore(item){
-  const box=q("editArea");
   const dirOpts=cfg.directions.map(d=>\`<option value="\${d.id}" \${item.direction===d.id?"selected":""}>\${d.label}</option>\`).join("");
   const fieldInputs=cfg.fields.map(f=>
     \`<div class="fg"><label>\${f.label}</label><input id="ef_\${f.id}" value="\${item.fields?.[f.id]||""}"></div>\`
@@ -1262,23 +1957,20 @@ function editScore(item){
   const subjInputs=(dir?.subjects||[]).map(s=>
     \`<div class="fg"><label>\${s}</label><input class="es" data-s="\${s}" value="\${item.scores?.[s]??0}" type="number" min="0" max="200"></div>\`
   ).join("");
-  box.innerHTML=\`<div class="card">
-    <div class="ch"><h3>编辑成绩记录</h3><button class="btn btn-g sm" onclick="q('editArea').innerHTML=''">✕ 关闭</button></div>
-    <div class="cb">
-      <div class="g3" style="margin-bottom:12px">\${fieldInputs}
-        <div class="fg"><label>考试方向</label><select id="e_dir" onchange="reloadEditSubj('\${item.examSessionId}','\${uid}')">\${dirOpts}</select></div>
-      </div>
-      <div style="padding-top:12px;border-top:1px solid var(--bd)">
-        <div style="font-size:12px;color:var(--sub);margin-bottom:8px;font-weight:600">各科成绩</div>
-        <div class="g4" id="e_subj">\${subjInputs}</div>
-      </div>
-      <div style="margin-top:12px;display:flex;gap:8px">
-        <button class="btn btn-p" onclick="saveEdit('\${item.examSessionId}','\${uid}')">💾 保存</button>
-      </div>
-      <div id="editMsg" class="msg"></div>
+  openModal("编辑成绩记录",\`
+    <div class="g3" style="margin-bottom:14px">\${fieldInputs}
+      <div class="fg"><label>考试方向</label><select id="e_dir" onchange="reloadEditSubj('\${item.examSessionId}','\${uid}')">\${dirOpts}</select></div>
     </div>
-  </div>\`;
-  box.scrollIntoView({behavior:"smooth"});
+    <div style="padding-top:12px;border-top:1px solid var(--bd)">
+      <div style="font-size:12px;color:var(--sub);margin-bottom:8px;font-weight:600">各科成绩</div>
+      <div class="g4" id="e_subj">\${subjInputs}</div>
+    </div>
+    <div style="margin-top:16px;display:flex;gap:8px;align-items:center">
+      <button class="btn btn-p" onclick="saveEdit('\${item.examSessionId}','\${uid}')">💾 保存</button>
+      <button class="btn btn-g" onclick="closeModal()">取消</button>
+      <span id="editMsg" class="msg"></span>
+    </div>
+  \`);
 }
 function reloadEditSubj(examSessionId,uid){
   const dir=cfg.directions.find(d=>d.id===q("e_dir").value);
@@ -1293,8 +1985,15 @@ async function saveEdit(examSessionId,uid){
   const scores={};
   document.querySelectorAll(".es").forEach(i=>{scores[i.dataset.s]=Number(i.value||0);});
   const r=await api("/api/admin/score",{action:"upsert",examSessionId,uid,fields,direction:q("e_dir").value,scores});
-  showMsg("editMsg",r.success?"保存成功 ✓":r.message,r.success?"ok":"er");
-  if(r.success){await loadScores();q("editArea").innerHTML="";}
+  if(r.success){
+    await loadScores();
+    closeModal();
+    // 若统计页展开着，刷新对应批次
+    const panel=q("ep_"+examSessionId);
+    if(panel&&panel.style.display!=="none") renderExamPanel(examSessionId);
+  } else {
+    showMsg("editMsg",r.message,"er");
+  }
 }
 
 function renderAddDyn(){
@@ -1494,20 +2193,161 @@ async function renderStats(){
   q("st_rec").textContent=list.length;
   q("st_exam").textContent=cfg.exams.length;
   const byExam={};
-  cfg.exams.forEach(e=>{byExam[e.id]=0;});
-  list.forEach(x=>{byExam[x.examSessionId]=(byExam[x.examSessionId]||0)+1;});
+  cfg.exams.forEach(e=>{byExam[e.id]=[];});
+  list.forEach(x=>{ if(byExam[x.examSessionId]) byExam[x.examSessionId].push(x); });
   const total=list.length||1;
+
   q("st_detail").innerHTML=cfg.exams.map(e=>{
-    const cnt=byExam[e.id]||0, pct=Math.round(cnt/total*100);
-    return \`<div style="margin-bottom:14px">
-      <div style="display:flex;justify-content:space-between;margin-bottom:4px">
-        <span>\${e.label}</span><span style="font-weight:600">\${cnt} 条（\${pct}%）</span>
+    const cnt=(byExam[e.id]||[]).length, pct=Math.round(cnt/total*100);
+    return \`<div style="border-bottom:1px solid var(--bd)">
+      <div onclick="toggleExamPanel('\${e.id}')" style="display:flex;align-items:center;gap:12px;padding:14px 20px;cursor:pointer;user-select:none;transition:background .15s" onmouseover="this.style.background='var(--blue3)'" onmouseout="this.style.background=''">
+        <span id="ep_arr_\${e.id}" style="font-size:11px;color:var(--sub);transition:transform .2s">▶</span>
+        <div style="flex:1">
+          <div style="display:flex;justify-content:space-between;margin-bottom:5px">
+            <span style="font-weight:600">\${e.label}</span>
+            <span style="font-size:13px;color:var(--sub)">\${cnt} 人 · \${pct}%</span>
+          </div>
+          <div style="background:#f0f0f0;border-radius:2px;height:6px;overflow:hidden">
+            <div style="background:var(--ac);width:\${pct}%;height:100%;border-radius:2px"></div>
+          </div>
+        </div>
       </div>
-      <div style="background:#f0f0f0;border-radius:2px;height:8px;overflow:hidden">
-        <div style="background:var(--ac);width:\${pct}%;height:100%;border-radius:2px;transition:width .6s"></div>
-      </div>
+      <div id="ep_\${e.id}" style="display:none;padding:0 20px 16px"></div>
     </div>\`;
-  }).join("")||"<p style='color:#bbb'>暂无数据</p>";
+  }).join("")||"<p style='color:#bbb;padding:20px'>暂无数据</p>";
+}
+
+function toggleExamPanel(examId){
+  const panel=q("ep_"+examId);
+  const arr=q("ep_arr_"+examId);
+  if(panel.style.display==="none"){
+    panel.style.display="block";
+    arr.style.transform="rotate(90deg)";
+    renderExamPanel(examId);
+  } else {
+    panel.style.display="none";
+    arr.style.transform="";
+  }
+}
+
+function renderExamPanel(examId){
+  const panel=q("ep_"+examId);
+  panel.innerHTML=\`<div style="color:var(--sub);font-size:13px;padding:8px 0">加载中…</div>\`;
+  api("/api/admin/score",{action:"list",examSessionId:examId}).then(r=>{
+    if(!r.success){panel.innerHTML=\`<p style='color:red'>加载失败：\${r.message||"未知错误"}</p>\`;return;}
+    const items=r.data;
+    if(!items.length){panel.innerHTML="<p style='color:#bbb;font-size:13px;padding:8px 0'>该批次暂无成绩记录</p>";return;}
+    panel.innerHTML=\`
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+        <span style="font-size:13px;color:var(--sub)">共 \${items.length} 条，直接修改后点右下角保存</span>
+        <button class="btn btn-g sm" onclick="renderExamPanel('\${examId}')">↺ 刷新</button>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px">
+        \${items.map(item=>renderStudentCard(item,examId)).join("")}
+      </div>\`;
+  }).catch(e=>{ panel.innerHTML=\`<p style='color:red'>请求异常：\${e.message}</p>\`; });
+}
+
+function renderStudentCard(item, examId){
+  const uidField=cfg.fields.find(f=>f.isUid);
+  const nameField=cfg.fields.find(f=>!f.isUid&&(f.label.includes("姓名")||f.id.includes("name")))||cfg.fields.find(f=>!f.isUid);
+  const dir=cfg.directions.find(d=>d.id===item.direction);
+  const uid=uidField?item.fields?.[uidField.id]:item.uid;
+  const name=nameField?item.fields?.[nameField.id]||"—":"—";
+  const cardId="sc_"+examId+"_"+item.uid;
+  const infoFields=cfg.fields.filter(f=>!f.isUid&&!f.isVerify);
+  const dirOpts=cfg.directions.map(d=>
+    \`<option value="\${d.id}" \${d.id===item.direction?"selected":""}>\${d.label}</option>\`
+  ).join("");
+  const subjects=dir?dir.subjects:[];
+  const scoreRows=subjects.map(s=>
+    \`<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+      <span style="font-size:12px;color:var(--sub);min-width:64px;flex-shrink:0">\${esc(s)}</span>
+      <input class="sc-inp" data-subj="\${esc(s)}" type="number" value="\${Number(item.scores?.[s]||0)}"
+        style="width:80px;padding:4px 8px;border:1px solid var(--bd);border-radius:2px;font-size:13px;font-family:inherit;outline:none"
+        oninput="scCardDirty('\${cardId}')">
+    </div>\`
+  ).join("");
+  const fieldRows=infoFields.map(f=>
+    \`<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+      <span style="font-size:12px;color:var(--sub);min-width:64px;flex-shrink:0">\${esc(f.label)}</span>
+      <input class="fi-inp" data-fid="\${f.id}" type="text" value="\${esc(item.fields?.[f.id]||"")}"
+        style="flex:1;padding:4px 8px;border:1px solid var(--bd);border-radius:2px;font-size:13px;font-family:inherit;outline:none"
+        oninput="scCardDirty('\${cardId}')">
+    </div>\`
+  ).join("");
+  return \`<div id="\${cardId}" style="border:1px solid var(--bd);border-radius:4px;background:var(--bg);overflow:hidden;transition:box-shadow .2s">
+    <div style="padding:12px 14px 10px;border-bottom:1px solid var(--bd);display:flex;justify-content:space-between;align-items:center">
+      <div>
+        <div style="font-weight:700;font-size:14px">\${esc(name)}</div>
+        <div style="font-size:11px;color:var(--sub);margin-top:2px">\${esc(uid)}</div>
+      </div>
+      <span id="\${cardId}_badge" style="font-size:11px;color:var(--sub);background:var(--bd);padding:2px 8px;border-radius:10px">\${esc(dir?.label||"—")}</span>
+    </div>
+    <div style="padding:12px 14px">
+      \${fieldRows?fieldRows+"<div style='height:6px'></div>":""}
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+        <span style="font-size:12px;color:var(--sub);min-width:64px;flex-shrink:0">考试方向</span>
+        <select class="dir-sel" onchange="scCardChangeDir('\${cardId}',this.value)"
+          style="flex:1;padding:4px 8px;border:1px solid var(--bd);border-radius:2px;font-size:13px;font-family:inherit;outline:none">
+          \${dirOpts}
+        </select>
+      </div>
+      <div class="score-rows" id="\${cardId}_scores">\${scoreRows}</div>
+    </div>
+    <div style="padding:8px 14px 12px;display:flex;justify-content:flex-end;gap:8px;border-top:1px solid var(--bd)">
+      <button class="btn btn-d sm" onclick="scCardDelete('\${cardId}','\${examId}','\${item.uid}')">🗑 删除</button>
+      <button id="\${cardId}_save" class="btn btn-p sm" onclick="scCardSave('\${cardId}','\${examId}','\${item.uid}')">保存</button>
+    </div>
+  </div>\`;
+}
+
+function scCardDirty(cardId){
+  const btn=q(cardId+"_save");
+  if(btn){ btn.textContent="💾 保存 *"; }
+}
+
+function scCardChangeDir(cardId, dirId){
+  scCardDirty(cardId);
+  const dir=cfg.directions.find(d=>d.id===dirId);
+  const badge=q(cardId+"_badge"); if(badge) badge.textContent=dir?.label||"—";
+  const container=q(cardId+"_scores");
+  if(!container||!dir) return;
+  container.innerHTML=dir.subjects.map(s=>
+    \`<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+      <span style="font-size:12px;color:var(--sub);min-width:64px;flex-shrink:0">\${esc(s)}</span>
+      <input class="sc-inp" data-subj="\${esc(s)}" type="number" value="0"
+        style="width:80px;padding:4px 8px;border:1px solid var(--bd);border-radius:2px;font-size:13px;font-family:inherit;outline:none"
+        oninput="scCardDirty('\${cardId}')">
+    </div>\`
+  ).join("");
+}
+
+async function scCardSave(cardId, examId, uid){
+  const card=q(cardId); const btn=q(cardId+"_save");
+  if(!card||!btn) return;
+  btn.textContent="保存中…"; btn.disabled=true;
+  const direction=card.querySelector(".dir-sel")?.value||"";
+  const scores={}; card.querySelectorAll(".sc-inp").forEach(inp=>{ scores[inp.dataset.subj]=Number(inp.value)||0; });
+  const fields={}; const uidField=cfg.fields.find(f=>f.isUid); if(uidField) fields[uidField.id]=uid;
+  card.querySelectorAll(".fi-inp").forEach(inp=>{ fields[inp.dataset.fid]=inp.value.trim(); });
+  const r=await api("/api/admin/score",{action:"upsert",examSessionId:examId,uid,direction,scores,fields});
+  if(r.success){
+    btn.textContent="✅ 已保存"; btn.disabled=false;
+    setTimeout(()=>{ btn.textContent="保存"; },2000);
+  } else {
+    btn.textContent="❌ 失败"; btn.disabled=false;
+    setTimeout(()=>{ btn.textContent="💾 保存 *"; },2000);
+  }
+}
+
+async function scCardDelete(cardId, examId, uid){
+  if(!confirm("确认删除该学生记录？")) return;
+  const r=await api("/api/admin/score",{action:"delete",examSessionId:examId,uid});
+  if(r.success){
+    const card=q(cardId);
+    if(card){ card.style.opacity="0"; card.style.transition="opacity .3s"; setTimeout(()=>card.remove(),300); }
+  } else { alert("删除失败："+r.message); }
 }
 </script>
 <script src="/admin-import.js"></script>
@@ -1517,21 +2357,117 @@ async function renderStats(){
     // ─── GET /admin-import.js  批量导入脚本 ─────────────────
     if (method === "GET" && url.pathname === "/admin-import.js") {
       const importJS = String.raw`
-let im_rawRows=[], im_headers=[], im_colMap=[];
+/* ══════════════════════════════════════════════════════════════
+   批量导入脚本 v2  —  智能兼容各类学校成绩单格式
+   ══════════════════════════════════════════════════════════════
+   新增能力：
+   1. 自动跳过"平均分/汇总"等统计行
+   2. 自动过滤"班次/校次/名次/排名"等非成绩列
+   3. 识别"-""—"等无成绩占位符，跳过而非报错
+   4. 成绩支持小数（82.5）、分数段（A/B）
+   5. 无方向列时，根据各行有成绩的科目集合自动推断方向
+   6. 推断时优先精确全集匹配，其次最大交集匹配
+   7. 手动选择"自动推断方向"后预览实时更新
+   8. 多 sheet 时弹出选择
+   9. 考号/准考证/学号等别名大幅扩充
+   10. 总分/合计列自动忽略
+   ══════════════════════════════════════════════════════════════ */
 
+let im_rawRows=[], im_headers=[], im_colMap=[], im_allParsedSubjects=[];
+
+/* ── 工具函数 ──────────────────────────────────────────────── */
+
+// 标准化字符串：去空白全角、转小写
 function norm(s){ return String(s||"").trim().replace(/[\s\u3000]+/g,"").toLowerCase(); }
+
+// 判断一个字符串是否是"无成绩"占位符
+function isEmptyScore(v){
+  const s=String(v||"").trim();
+  return s===""||s==="-"||s==="—"||s==="--"||s==="缺考"||s==="作弊"||s==="免考"||s==="*";
+}
+
+// 判断一行是否是统计/汇总行（应跳过）
+function isSummaryRow(row, uidColIdx){
+  const nameCol=String(row[0]||"").trim();
+  const summaryNames=["平均分","最高分","最低分","总计","合计","班平均","年级平均","参考人数","应考人数","实考人数","标准差","及格率","优秀率","备注"];
+  for(const n of summaryNames){ if(nameCol.includes(n)) return true; }
+  if(uidColIdx>=0){
+    const uid=String(row[uidColIdx]||"").trim();
+    if(!uid||uid==="—"||uid==="-") return true;
+  }
+  return false;
+}
+
+// 判断列名是否是排名/次序列（应自动忽略）
+const RANK_PATTERNS=["班次","校次","年级次","班名次","校名次","名次","排名","rank","class_rank","grade_rank","总分名次","总分班次","总分校次"];
+function isRankColumn(header){
+  const h=norm(header);
+  if(!h) return true;
+  // "班次/校次" 这类复合名也要命中
+  return RANK_PATTERNS.some(p=>h===norm(p)||h.includes(norm(p)));
+}
+
+// 判断列名是否是总分/合计列（应自动忽略）
+const TOTAL_PATTERNS=["总分","合计","总计","total","sum","综合分","总成绩"];
+function isTotalColumn(header){
+  const h=norm(header);
+  return TOTAL_PATTERNS.some(p=>h===norm(p)||h===p);
+}
+
+// 把成绩值解析为数字（支持小数、整数；等级制返回字符串；无成绩返回 undefined；非法返回 null）
+function parseScore(v){
+  const s=String(v||"").trim();
+  if(isEmptyScore(s)) return undefined;
+  const cleaned=s.replace(/分$/,"").trim();
+  const n=Number(cleaned);
+  if(!isNaN(n)) return n;
+  if(/^[a-eA-E][+\-＋－]?$/.test(s)||/^[优良中差不及格]+$/.test(s)) return s;
+  return null;
+}
+
+/* ── 方向推断 ──────────────────────────────────────────────── */
+
+function inferDirection(scoredSubjects){
+  if(!scoredSubjects.length) return null;
+  const scored=new Set(scoredSubjects);
+  let bestId=null, bestScore=-1;
+  for(const d of cfg.directions){
+    const ds=new Set(d.subjects||[]);
+    let inter=0; for(const s of scored){ if(ds.has(s)) inter++; }
+    if(inter===scored.size && inter===ds.size) return d.id;
+    const ratio= ds.size>0 ? inter/ds.size : 0;
+    const penalty= scored.size>ds.size ? (scored.size-inter)*0.3 : 0;
+    const sc=ratio - penalty;
+    if(sc>bestScore){ bestScore=sc; bestId=d.id; }
+  }
+  return bestScore>0.3 ? bestId : null;
+}
+
+function matchDirection(val){
+  const v=norm(val);
+  if(!v||v==="-"||v==="—") return null;
+  for(const d of cfg.directions){ if(norm(d.id)===v||norm(d.label)===v) return d.id; }
+  for(const d of cfg.directions){
+    if(norm(d.label).includes(v)||v.includes(norm(d.label))) return d.id;
+    if(norm(d.id).includes(v)||v.includes(norm(d.id))) return d.id;
+  }
+  return null;
+}
+
+/* ── 列匹配规则 ──────────────────────────────────────────────── */
 
 function buildMatchRules(){
   const rules=[];
   cfg.fields.forEach(f=>{
-    const aliases=[norm(f.label), norm(f.id), norm(f.placeholder||"")];
-    if(f.isUid) aliases.push("准考证","考号","准考证号","examid","uid","id");
-    if(norm(f.label).includes("姓名")||norm(f.id).includes("name")) aliases.push("姓名","名字","name");
-    if(norm(f.label).includes("学校")||norm(f.id).includes("school")) aliases.push("学校","学校名称","school","单位");
+    const aliases=[norm(f.label), norm(f.id), norm(f.placeholder||"")].filter(Boolean);
+    if(f.isUid) aliases.push("准考证","考号","准考证号","examid","uid","id","学号","考生编号","报名号","编号","座位号","考籍号");
+    if(norm(f.label).includes("姓名")||norm(f.id).includes("name")) aliases.push("姓名","名字","name","考生姓名","学生姓名");
+    if(norm(f.label).includes("班")||norm(f.id).includes("class")) aliases.push("班级","班","class","所在班级","行政班");
+    if(norm(f.label).includes("学校")||norm(f.id).includes("school")) aliases.push("学校","学校名称","school","单位","就读学校");
     rules.push({ type:"field", fieldId:f.id, label:f.label, aliases:[...new Set(aliases)] });
   });
   rules.push({ type:"direction", fieldId:"__direction__", label:"方向",
-    aliases:["方向","考试方向","direction","dir","类别","专业方向","track"] });
+    aliases:["方向","考试方向","direction","dir","类别","专业方向","track","选科方向","科类","文理"] });
   const allSubjects=[...new Set(cfg.directions.flatMap(d=>d.subjects))];
   allSubjects.forEach(s=>{
     rules.push({ type:"subject", fieldId:"__subj__"+s, label:s, aliases:[norm(s)] });
@@ -1540,23 +2476,17 @@ function buildMatchRules(){
 }
 
 function matchColumn(header, rules){
+  if(isRankColumn(header)) return { type:"skip", fieldId:"__rank__", label:"排名列", confidence:"exact" };
+  if(isTotalColumn(header)) return { type:"skip", fieldId:"__total__", label:"总分列", confidence:"exact" };
   const h=norm(header);
-  for(const r of rules){ if(r.aliases.some(a=>a===h)) return {...r, confidence:"exact"}; }
-  for(const r of rules){ if(r.aliases.some(a=>h.includes(a)||a.includes(h))) return {...r, confidence:"fuzzy"}; }
+  if(!h) return { type:"skip", fieldId:"__empty__", label:"空列", confidence:"exact" };
+  for(const r of rules){ if(r.type!=="skip"&&r.aliases.some(a=>a===h)) return {...r, confidence:"exact"}; }
+  for(const r of rules){ if(r.type!=="skip"&&r.aliases.some(a=>h.includes(a)||a.includes(h))) return {...r, confidence:"fuzzy"}; }
   if(h) return { type:"subject", fieldId:"__subj__"+header.trim(), label:header.trim(), aliases:[h], confidence:"unknown" };
   return null;
 }
 
-function matchDirection(val){
-  const v=norm(val);
-  if(!v||v==="-") return null;
-  for(const d of cfg.directions){ if(norm(d.id)===v||norm(d.label)===v) return d.id; }
-  for(const d of cfg.directions){
-    if(norm(d.label).includes(v)||v.includes(norm(d.label))) return d.id;
-    if(norm(d.id).includes(v)||v.includes(norm(d.id))) return d.id;
-  }
-  return null;
-}
+/* ── 文件处理 ──────────────────────────────────────────────── */
 
 async function handleImportFile(file){
   if(!file) return;
@@ -1583,67 +2513,107 @@ async function parseExcel(file){
     });
   }
   const buf=await file.arrayBuffer();
-  const wb=XLSX.read(buf,{type:"array"});
-  const ws=wb.Sheets[wb.SheetNames[0]];
-  const rows=XLSX.utils.sheet_to_json(ws,{header:1,defval:""});
+  const wb=XLSX.read(buf,{type:"array",cellText:true,cellDates:false});
+  let sheetName=wb.SheetNames[0];
+  if(wb.SheetNames.length>1){
+    const choice=await pickSheet(wb.SheetNames);
+    if(!choice){ q("im_parsing").style.display="none"; return; }
+    sheetName=choice;
+  }
+  const ws=wb.Sheets[sheetName];
+  const rows=XLSX.utils.sheet_to_json(ws,{header:1,defval:"",raw:true});
   if(!rows.length) throw new Error("表格为空");
-  im_headers=rows[0].map(h=>String(h||"").trim());
-  im_rawRows=rows.slice(1).filter(r=>r.some(c=>String(c||"").trim()));
+  // 找表头行（跳过列数很少的大标题行）
+  let headerRowIdx=0;
+  const maxCols=Math.max(...rows.slice(0,5).map(r=>r.length));
+  for(let i=0;i<Math.min(5,rows.length);i++){
+    if(rows[i].filter(c=>String(c||"").trim()).length >= maxCols*0.5){ headerRowIdx=i; break; }
+  }
+  im_headers=rows[headerRowIdx].map(h=>String(h||"").trim());
+  const dataRows=rows.slice(headerRowIdx+1).filter(r=>r.some(c=>String(c||"").trim()));
+  const rules=buildMatchRules();
+  const tmpMap=im_headers.map(h=>matchColumn(h,rules));
+  const uidColIdx=tmpMap.findIndex(m=>m&&m.type==="field"&&cfg.fields.find(f=>f.id===m.fieldId&&f.isUid));
+  im_rawRows=dataRows.filter(r=>!isSummaryRow(r, uidColIdx));
   q("im_parsing").style.display="none";
   buildColMapUI();
+}
+
+function pickSheet(names){
+  return new Promise(res=>{
+    const overlay=document.createElement("div");
+    overlay.style.cssText="position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:9999;display:flex;align-items:center;justify-content:center";
+    const box=document.createElement("div");
+    box.setAttribute("data-overlay","");
+    box.style.cssText="background:#fff;border-radius:6px;padding:24px 28px;min-width:280px;max-width:400px";
+    box.innerHTML="<div style='font-size:15px;font-weight:700;margin-bottom:14px'>选择要导入的 Sheet</div>"
+      +names.map(n=>"<button data-name='"+n+"' style='display:block;width:100%;text-align:left;padding:9px 14px;margin-bottom:6px;border:1px solid #d0d7e6;border-radius:4px;background:#fafbff;cursor:pointer;font-size:13px;font-family:inherit'>"+n+"</button>").join("")
+      +"<button data-name='__cancel__' style='margin-top:4px;padding:6px 14px;border:1px solid #ccc;border-radius:4px;background:#fff;cursor:pointer;font-size:12px;color:#666'>取消</button>";
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+    box.addEventListener("click",e=>{
+      const btn=e.target.closest("[data-name]");
+      if(!btn) return;
+      document.body.removeChild(overlay);
+      res(btn.dataset.name==="__cancel__"?null:btn.dataset.name);
+    });
+  });
 }
 
 async function parseTextFile(file, ext){
   const text=await file.text();
   const lines=text.split(/\r?\n/).filter(l=>l.trim());
   if(!lines.length) throw new Error("文件为空");
-  const delimiters=[
-    {sep:"\t", name:"制表符"},
-    {sep:",", name:"逗号"},
-    {sep:"|", name:"竖线"},
-    {sep:";", name:"分号"},
-  ];
+  const delimiters=[{sep:"\t"},{sep:","},{sep:"|"},{sep:";"}];
   let best=delimiters[0], bestCount=0;
-  for(const d of delimiters){
-    const cnt=(lines[0].split(d.sep).length-1);
-    if(cnt>bestCount){ bestCount=cnt; best=d; }
-  }
-  const split=bestCount>0 ? (l=>l.split(best.sep)) : (l=>l.trim().split(/\s{2,}/));
+  for(const d of delimiters){ const c=(lines[0].split(d.sep).length-1); if(c>bestCount){bestCount=c;best=d;} }
+  const split=bestCount>0?(l=>l.split(best.sep)):(l=>l.trim().split(/\s{2,}/));
   im_headers=split(lines[0]).map(h=>h.trim());
-  im_rawRows=lines.slice(1).map(l=>split(l).map(c=>c.trim())).filter(r=>r.some(c=>c));
+  const rules=buildMatchRules();
+  const tmpMap=im_headers.map(h=>matchColumn(h,rules));
+  const uidColIdx=tmpMap.findIndex(m=>m&&m.type==="field"&&cfg.fields.find(f=>f.id===m.fieldId&&f.isUid));
+  im_rawRows=lines.slice(1).map(l=>split(l).map(c=>c.trim())).filter(r=>r.some(c=>c)&&!isSummaryRow(r,uidColIdx));
   q("im_parsing").style.display="none";
   buildColMapUI();
 }
 
+/* ── 列映射 UI ──────────────────────────────────────────────── */
+
 function buildColMapUI(){
   const rules=buildMatchRules();
   im_colMap=im_headers.map(h=>({ header:h, match:matchColumn(h,rules) }));
+  const knownSubjects=[...new Set(cfg.directions.flatMap(d=>d.subjects))];
   const allOptions=[
     "<option value='__skip__'>— 忽略此列 —</option>",
     "<optgroup label='学生信息'>",
     ...cfg.fields.map(f=>"<option value='field:"+f.id+"'>"+f.label+"</option>"),
     "</optgroup>",
     "<optgroup label='特殊'>",
-    "<option value='direction:'>考试方向</option>",
+    "<option value='direction:'>考试方向（明确列）</option>",
+    "<option value='direction:__auto__'>✨ 自动推断方向</option>",
     "</optgroup>",
     "<optgroup label='科目成绩'>",
-    ...[...new Set(cfg.directions.flatMap(d=>d.subjects))].map(s=>"<option value='subj:"+s+"'>"+s+"</option>"),
+    ...knownSubjects.map(s=>"<option value='subj:"+s+"'>"+s+"</option>"),
     "<option value='subj:__custom__'>（自定义科目，用列名）</option>",
     "</optgroup>",
   ].join("");
+
   const rows=im_colMap.map((c,i)=>{
     const m=c.match;
     let color="var(--sub)", badge="";
     if(m){
-      if(m.confidence==="exact")   { color="var(--green)"; badge="<span style='color:var(--green);font-size:11px'>✅ 自动</span>"; }
-      else if(m.confidence==="fuzzy") { color="var(--gold)"; badge="<span style='color:var(--gold);font-size:11px'>⚠️ 请确认</span>"; }
+      if(m.type==="skip"){ color="#bbb"; badge="<span style='color:#bbb;font-size:11px'>⏭ 自动跳过</span>"; }
+      else if(m.confidence==="exact"){ color="var(--green)"; badge="<span style='color:var(--green);font-size:11px'>✅ 自动识别</span>"; }
+      else if(m.confidence==="fuzzy"){ color="var(--gold)"; badge="<span style='color:var(--gold);font-size:11px'>⚠️ 请确认</span>"; }
       else { color="var(--red)"; badge="<span style='color:var(--red);font-size:11px'>❓ 未知列</span>"; }
     }
+    const example=String(im_rawRows[0]?.[i]||"").trim();
     return "<tr><td style='padding:7px 12px;font-weight:600;color:"+color+";white-space:nowrap'>"+c.header+"</td>"
       +"<td style='padding:7px 12px'>"+badge+"</td>"
       +"<td style='padding:7px 12px'><select id='cm_"+i+"' style='padding:5px 8px;border:1px solid var(--bd);border-radius:2px;font-size:12px;font-family:inherit;outline:none;min-width:160px'>"+allOptions+"</select></td>"
-      +"<td style='padding:7px 12px;font-size:11px;color:#aaa'>示例："+(im_rawRows[0]?.[i]||"")+"</td></tr>";
+      +"<td style='padding:7px 12px;font-size:11px;color:#aaa'>"+example+"</td></tr>";
   }).join("");
+
   q("im_mapTable").innerHTML="<table style='border-collapse:collapse;font-size:13px;width:100%'>"
     +"<thead><tr style='background:#f5f7fa'>"
     +"<th style='padding:7px 12px;text-align:left;font-size:12px;color:var(--sub);border-bottom:1px solid var(--bd)'>文件列名</th>"
@@ -1651,29 +2621,55 @@ function buildColMapUI(){
     +"<th style='padding:7px 12px;text-align:left;font-size:12px;color:var(--sub);border-bottom:1px solid var(--bd)'>映射到</th>"
     +"<th style='padding:7px 12px;text-align:left;font-size:12px;color:var(--sub);border-bottom:1px solid var(--bd)'>数据示例</th>"
     +"</tr></thead><tbody>"+rows+"</tbody></table>";
+
   im_colMap.forEach((_,i)=>{
     const sel=q("cm_"+i);
     if(!sel) return;
     const m=im_colMap[i].match;
     let val="__skip__";
     if(m){
-      if(m.type==="field") val="field:"+m.fieldId;
+      if(m.type==="skip") val="__skip__";
+      else if(m.type==="field") val="field:"+m.fieldId;
       else if(m.type==="direction") val="direction:";
-      else val="subj:"+m.fieldId.replace("__subj__","");
-      if(m.confidence==="unknown") val="subj:"+im_colMap[i].header;
+      else {
+        const rawSubj=m.fieldId.replace("__subj__","");
+        val="subj:"+rawSubj;
+        // 若下拉里没有此选项（新科目），追加
+        if(!sel.querySelector("[value='"+val+"']")){
+          const opt=document.createElement("option");
+          opt.value=val; opt.textContent=im_colMap[i].header+"（新科目）";
+          sel.appendChild(opt);
+        }
+      }
     }
     sel.value=val;
   });
+
+  // 无方向列时提示
+  const hasDirectionCol=im_colMap.some((_,i)=>{ const v=q("cm_"+i)?.value||""; return v==="direction:"; });
+  if(!hasDirectionCol){
+    const tip=document.createElement("div");
+    tip.style.cssText="background:#fffbe6;border:1px solid #ffe58f;border-radius:4px;padding:10px 14px;font-size:12px;color:#7c6000;margin-bottom:10px";
+    tip.innerHTML="💡 <strong>未检测到方向列</strong> — 将根据每行有成绩的科目自动推断考试方向";
+    const tbl=q("im_mapTable");
+    tbl.parentNode.insertBefore(tip, tbl);
+  }
+
   q("im_mapArea").style.display="block";
 }
 
+/* ── 预览 ──────────────────────────────────────────────────── */
+
 function renderImportPreview(){
   const finalMap=im_colMap.map((_,i)=>({ header:im_colMap[i].header, mapped:q("cm_"+i)?.value||"__skip__" }));
+  const hasExplicitDir=finalMap.some(c=>c.mapped==="direction:");
+  const knownSubjects=new Set(cfg.directions.flatMap(d=>d.subjects));
+
   const parsed=im_rawRows.map((row,ri)=>{
     const fields={}, scores={};
     let direction=null, dirRaw="", warnings=[];
     finalMap.forEach((col,ci)=>{
-      const val=String(row[ci]||"").trim();
+      const val=String(row[ci]??""  ).trim();
       if(col.mapped==="__skip__") return;
       if(col.mapped.startsWith("field:")){
         const fid=col.mapped.replace("field:","");
@@ -1681,29 +2677,44 @@ function renderImportPreview(){
       } else if(col.mapped==="direction:"){
         dirRaw=val;
         direction=matchDirection(val);
-        if(val&&val!=="-"&&!direction) warnings.push("方向\""+val+"\"未匹配");
+        if(val&&!isEmptyScore(val)&&!direction) warnings.push("方向\""+val+"\"未匹配，将留空");
       } else if(col.mapped.startsWith("subj:")){
         let subj=col.mapped.replace("subj:","");
         if(subj==="__custom__") subj=col.header;
-        if(val==="-"||val==="") {}
-        else { const n=Number(val); scores[subj]=isNaN(n)?null:n; if(isNaN(n)) warnings.push("\""+subj+"\"成绩\""+val+"\"非数字"); }
+        if(isEmptyScore(val)) return;
+        const ps=parseScore(val);
+        if(ps===null) warnings.push("「"+subj+"」值「"+val+"」非数字");
+        else if(ps!==undefined) scores[subj]=ps;
       }
     });
+    if(!direction){
+      const scoredKnown=Object.keys(scores).filter(s=>knownSubjects.has(s));
+      const inferred=inferDirection(scoredKnown);
+      if(inferred){
+        direction=inferred;
+        dirRaw="✨ 自动："+( cfg.directions.find(d=>d.id===inferred)?.label||inferred);
+      }
+    }
     const uidField=cfg.fields.find(f=>f.isUid);
-    const uid=uidField?fields[uidField.id]:"";
+    const uid=uidField?(fields[uidField.id]||""):"";
     if(!uid) warnings.push("uid为空");
     return { fields, direction, dirRaw, scores, uid, warnings, rowIdx:ri+2 };
   });
+
   const okCount=parsed.filter(r=>!r.warnings.length).length;
   const warnCount=parsed.filter(r=>r.warnings.length&&r.uid).length;
   const errCount=parsed.filter(r=>!r.uid).length;
-  q("im_summary").innerHTML="共 <strong>"+parsed.length+"</strong> 行 · <span style='color:var(--green)'>✅ "+okCount+" 正常</span> · <span style='color:var(--gold)'>⚠️ "+warnCount+" 警告</span> · <span style='color:var(--red)'>❌ "+errCount+" 错误（将跳过）</span>";
+  const autoInfCount=parsed.filter(r=>r.dirRaw&&r.dirRaw.startsWith("✨")).length;
+  q("im_summary").innerHTML="共 <strong>"+parsed.length+"</strong> 行 · <span style='color:var(--green)'>✅ "+okCount+" 正常</span> · <span style='color:var(--gold)'>⚠️ "+warnCount+" 警告</span> · <span style='color:var(--red)'>❌ "+errCount+" 错误（跳过）</span>"
+    +(autoInfCount?" · <span style='color:#9254de'>✨ "+autoInfCount+" 行方向已自动推断</span>":"");
+
   const fieldCols=cfg.fields.map(f=>"<th style='padding:7px 10px;white-space:nowrap'>"+f.label+"</th>").join("");
   const allSubjs=[...new Set(parsed.flatMap(r=>Object.keys(r.scores)))];
   const subjCols=allSubjs.map(s=>"<th style='padding:7px 10px;white-space:nowrap'>"+s+"</th>").join("");
   const bodyRows=parsed.map(r=>{
     const bg=r.warnings.length?(r.uid?"#fffbe6":"#fff2f0"):"";
     const fieldTds=cfg.fields.map(f=>"<td style='padding:6px 10px'>"+(r.fields[f.id]||"—")+"</td>").join("");
+    const dirStyle=r.dirRaw.startsWith("✨")?"color:#9254de;font-size:11px":"";
     const subjTds=allSubjs.map(s=>{
       const v=r.scores[s];
       if(v===undefined) return "<td style='padding:6px 10px;color:#ccc'>-</td>";
@@ -1713,7 +2724,10 @@ function renderImportPreview(){
     const warnTd=r.warnings.length
       ?"<td style='padding:6px 10px;color:"+(r.uid?"var(--gold)":"var(--red)")+";font-size:11px'>"+r.warnings.join("；")+"</td>"
       :"<td style='padding:6px 10px;color:var(--green);font-size:11px'>✅</td>";
-    return "<tr style='background:"+bg+";border-bottom:1px solid #f0f0f0'><td style='padding:6px 10px;color:var(--sub);font-size:11px'>"+r.rowIdx+"</td>"+fieldTds+"<td style='padding:6px 10px'>"+(r.dirRaw||"—")+"</td>"+subjTds+warnTd+"</tr>";
+    return "<tr style='background:"+bg+";border-bottom:1px solid #f0f0f0'>"
+      +"<td style='padding:6px 10px;color:var(--sub);font-size:11px'>"+r.rowIdx+"</td>"
+      +fieldTds+"<td style='padding:6px 10px;"+dirStyle+"'>"+(r.dirRaw||"—")+"</td>"
+      +subjTds+warnTd+"</tr>";
   }).join("");
   q("im_previewTable").innerHTML="<table style='border-collapse:collapse;font-size:12px;min-width:100%'>"
     +"<thead style='background:var(--ac);color:#fff;position:sticky;top:0'><tr>"
@@ -1724,6 +2738,8 @@ function renderImportPreview(){
   q("im_mapArea").style.display="none";
   q("im_previewArea").style.display="block";
 }
+
+/* ── 导入执行 ──────────────────────────────────────────────── */
 
 async function doImport(){
   const parsed=q("im_previewArea")._parsed||[];
